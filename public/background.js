@@ -292,6 +292,13 @@ chrome.runtime.onInstalled.addListener(() => {
         log("Initialized storage.");
         
         checkAndResetWeekIfNeeded();
+        
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+          if (tabs && tabs[0]) {
+            log("Browser started - beginning tracking for active tab");
+            updateCurrentTab(tabs[0].id, tabs[0]);
+          }
+        });
       }
     )
     .catch((error) => {
@@ -311,7 +318,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 });
 
 function log(message) {
-  if (DEBUG) console.log(message);
+  if (DEBUG) {
+    const timestamp = new Date().toLocaleTimeString();
+    console.log(`[${timestamp}] ${message}`);
+  }
 }
 
 function getNextSundayMidnight() {
@@ -397,10 +407,8 @@ async function saveTabSession(tab) {
     return;
   }
   
-  if (duration < 1000) {
-    log(`Session duration too short (${duration}ms), skipping save.`);
-    return;
-  }
+  // Don't filter out short sessions - they add up!
+  // Even 100ms sessions are valid if user is rapidly switching tabs
   
   tab.endTime = endTime;
   try {
@@ -464,11 +472,16 @@ async function updateCurrentTab(tabId, tab) {
   }
 }
 
-// Event Listeners
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
   const currentTab = await storage.get_local('limitify_curtab');
 
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
+    // don't stop tracking if user is just idle (video might be playing)
+    if (isIdle) {
+      log('WINDOW_LOST_FOCUS during idle: keeping tracking (video playing)');
+      return;
+    }
+    
     log('WINDOW_LOST_FOCUS: left browser window(s)');
     if (currentTab?.startTime) {
       await saveTabSession(currentTab);
@@ -485,26 +498,43 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
   }
 });
 
+// track current idle state globally
+let isIdle = false;
+
 chrome.idle.onStateChanged.addListener(async (newState) => {
   log(`CHANGED STATE TO: ${newState}`);
   
   const currentTab = await storage.get_local('limitify_curtab');
   
-  if (newState === TAB_STATES.IDLE || newState === TAB_STATES.LOCKED) {
-    log(`${newState.toUpperCase()}: gone into ${newState}`);
+  if (newState === TAB_STATES.IDLE) {
+    // User idle (no input) but screen still on
+    isIdle = true;
+    log(`User went idle, continuing to track (video/reading)`);
+    
+  } else if (newState === TAB_STATES.LOCKED) {
+    // Screen locked - user definitely not using computer
+    // Save session and stop tracking
+    isIdle = false;
+    log(`Screen locked, stopping tracking`);
     if (currentTab?.startTime) {
       await saveTabSession(currentTab);
+      await storage.set_local('limitify_curtab', {...EMPTY_TAB});
     }
-    await storage.set_local('limitify_curtab', {...EMPTY_TAB});
-  } else if (newState === TAB_STATES.ACTIVE) {
-    log(`ACTIVE: back from being idle/locked`);
-    await storage.set_local('limitify_curtab', {...EMPTY_TAB});
     
-    try {
-      const tab = await getCurrentTab();
-      await updateCurrentTab(tab.id, tab);
-    } catch (error) {
-      log(`Failed to handle active state: ${error}`);
+  } else if (newState === TAB_STATES.ACTIVE) {
+    // User returned - start tracking current tab
+    isIdle = false;
+    log(`User active again, resuming tracking`);
+    
+    // If we had stopped tracking (from locked), restart
+    const hasTracking = currentTab?.startTime;
+    if (!hasTracking) {
+      try {
+        const tab = await getCurrentTab();
+        await updateCurrentTab(tab.id, tab);
+      } catch (error) {
+        log(`Failed to resume tracking: ${error}`);
+      }
     }
   }
 });
@@ -519,6 +549,42 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   chrome.tabs.get(activeInfo.tabId, (tab) => {
     updateCurrentTab(tab.id, tab);
   });
+});
+
+// CRITICAL: Save time when tab is closed
+chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
+  const currentTab = await storage.get_local('limitify_curtab');
+  
+  // If the closed tab is the one we're tracking, save its session
+  if (currentTab?.id === tabId && currentTab?.startTime) {
+    log(`Tab closed: ${tabId}, saving session`);
+    await saveTabSession(currentTab);
+    await storage.set_local('limitify_curtab', {...EMPTY_TAB});
+  }
+});
+
+// Handle tab replacement (e.g., when exiting fullscreen on some sites)
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  chrome.tabs.get(addedTabId, (tab) => {
+    if (tab) {
+      log(`Tab replaced: ${removedTabId} -> ${addedTabId}`);
+      updateCurrentTab(addedTabId, tab);
+    }
+  });
+});
+
+// Additional listener for tab visibility changes
+// This catches cases where onActivated doesn't fire (e.g., fullscreen mode)
+chrome.tabs.onHighlighted.addListener((highlightInfo) => {
+  if (highlightInfo.tabIds.length > 0) {
+    const tabId = highlightInfo.tabIds[0];
+    chrome.tabs.get(tabId, (tab) => {
+      if (tab) {
+        log(`Tab highlighted: ${tabId}`);
+        updateCurrentTab(tabId, tab);
+      }
+    });
+  }
 });
 
 chrome.runtime.setUninstallURL(
