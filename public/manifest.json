@@ -23,6 +23,7 @@
       "storage",
       "background",
       "unlimitedStorage",
-      "idle"
+      "idle",
+      "alarms"
     ]
   }

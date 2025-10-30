@@ -94,120 +94,99 @@ const EMPTY_TAB = {
   endTime: null
 };
 
+const MAX_SESSION_DURATION = 24 * 60 * 60 * 1000;
+
 const storage = {
-  add(value) {
-    const key = "data";
-    return new Promise((resolve) => {
-      const startDate = new Date(value.startTime);
-      const endDate = new Date(value.endTime);
+  _getEndOfDay(date) {
+    const end = new Date(date);
+    end.setHours(23, 59, 59, 999);
+    return end;
+  },
 
-      this.get("limitify_curweek").then((curweek) => {
-        var curweekstart = new Date(curweek.start);
-        var curweekend = new Date(curweek.end);
+  _getStartOfNextDay(date) {
+    const next = new Date(date);
+    next.setDate(date.getDate() + 1);
+    next.setHours(0, 0, 0, 0);
+    return next;
+  },
 
-        if (startDate > curweekend) {
-          DEBUG
-            ? console.log(
-                "NEW WEEK: updating curweek in storage & reseting all data"
-              )
-            : null;
-          // new week
-          // set curweekstart to start of new week
-          // set curweekend to end of new week
-          const startweek = new Date(startDate);
-          startweek.setDate(startDate.getDate() - startDate.getDay());
-          startweek.setHours(0, 0, 0, 0);
+  _getWeekBoundaries(date) {
+    const startweek = new Date(date);
+    startweek.setDate(date.getDate() - date.getDay()); // sunday
+    startweek.setHours(0, 0, 0, 0);
 
-          const endweek = new Date(startweek);
-          endweek.setDate(startweek.getDate() + 6);
-          endweek.setHours(23, 59, 59, 999);
+    const endweek = new Date(startweek);
+    endweek.setDate(startweek.getDate() + 6); // saturday
+    endweek.setHours(23, 59, 59, 999);
 
-          const promises = [
-            this.set("limitify_curweek", {
-              start: startweek.getTime(),
-              end: endweek.getTime(),
-            }),
-            this.set(key + "_0", {}),
-            this.set(key + "_1", {}),
-            this.set(key + "_2", {}),
-            this.set(key + "_3", {}),
-            this.set(key + "_4", {}),
-            this.set(key + "_5", {}),
-            this.set(key + "_6", {}),
-          ];
+    return { start: startweek.getTime(), end: endweek.getTime() };
+  },
 
-          Promise.all(promises).then(() => {
-            resolve();
-          });
+  async _resetWeekData(newWeekBoundaries) {
+    log("NEW WEEK: updating curweek in storage & reseting all data");
+    
+    const promises = [
+      this.set("limitify_curweek", newWeekBoundaries),
+      this.set("data_0", {}),
+      this.set("data_1", {}),
+      this.set("data_2", {}),
+      this.set("data_3", {}),
+      this.set("data_4", {}),
+      this.set("data_5", {}),
+      this.set("data_6", {})
+    ];
+    
+    await Promise.all(promises);
+  },
+
+  async _addToDay(url, dayOfWeek, durationSeconds) {
+    const dayData = await this.get(`data_${dayOfWeek}`);
+    
+    dayData[url] = (dayData[url] || 0) + durationSeconds;
+    dayData.total = (dayData.total || 0) + durationSeconds;
+    
+    log(`+${durationSeconds.toFixed(1)} seconds to ${url} on day ${dayOfWeek}`);
+    
+    await this.set(`data_${dayOfWeek}`, dayData);
+  },
+
+  async add(value) {
+    let startDate = new Date(value.startTime);
+    let endDate = new Date(value.endTime);
+    const url = value.url;
+
+    const curweek = await this.get("limitify_curweek");
+    const curweekend = new Date(curweek.end);
+
+    if (startDate > curweekend) {
+      const newWeekBoundaries = this._getWeekBoundaries(startDate);
+      await this._resetWeekData(newWeekBoundaries);
+    }
+
+    // split session into daily chunks
+    while (startDate < endDate) {
+      const endOfCurrentDay = this._getEndOfDay(startDate);
+      const chunkEnd = (endDate <= endOfCurrentDay) ? endDate : endOfCurrentDay;
+      
+      const durationSeconds = (chunkEnd.getTime() - startDate.getTime()) / 1000;
+      const dayOfWeek = startDate.getDay();
+      
+      await this._addToDay(url, dayOfWeek, durationSeconds);
+
+      if (endDate > endOfCurrentDay) {
+        startDate = this._getStartOfNextDay(startDate);
+        
+        const updatedWeek = await this.get("limitify_curweek");
+        const weekEnd = new Date(updatedWeek.end);
+        
+        if (startDate > weekEnd) {
+          const newWeekBoundaries = this._getWeekBoundaries(startDate);
+          await this._resetWeekData(newWeekBoundaries);
         }
-
-        if (startDate <= curweekend && endDate > curweekend) {
-          // case when start and end dates span across multiple weeks
-          value.endTime = curweekend;
-          this.add(value).then(() => {
-            resolve();
-          });
-
-          var temp = new Date(curweekend);
-          temp.setDate(curweekend.getDate() + 1);
-          temp.setHours(0, 0, 0, 0);
-          value.startTime = temp;
-          value.endTime = endDate;
-
-          this.add(value).then(() => {
-            resolve();
-          });
-        } else if (startDate.getDay() !== endDate.getDay()) {
-          // at this point, we know that
-          // startDate <= curweekend && endDate <= curweekend
-          // however, it's still possible that startDate and endDate span across multiple days
-
-          value.endTime = new Date(startDate);
-          value.endTime.setHours(23, 59, 59, 999);
-
-          this.add(value).then(() => {
-            value.startTime = new Date(startDate);
-            value.startTime.setDate(startDate.getDate() + 1);
-            value.startTime.setHours(0, 0, 0, 0);
-            value.endTime = new Date(endDate);
-
-            this.add(value).then(() => {
-              resolve();
-            });
-          });
-        } else if (startDate.getDay() === endDate.getDay()) {
-          // at this point, we know that
-          // startDate.getDay() == endDate.getDay()
-
-          const dayOfWeek = startDate.getDay().toString();
-          this.get(key + "_" + dayOfWeek).then((result) => {
-            if (Object.keys(result).length === 0) {
-              result = {};
-            }
-            if (!result.hasOwnProperty(value.url)) {
-              result[value.url] = 0;
-            }
-
-            if (!result.hasOwnProperty("total")) {
-              result["total"] = 0;
-            }
-
-            var toadd =
-              Math.abs(startDate.getTime() - endDate.getTime()) / 1000;
-            result[value.url] += toadd;
-            result["total"] += toadd;
-
-            DEBUG
-              ? console.log("+" + toadd + " seconds to " + value.url)
-              : null;
-
-            this.set(key + "_" + dayOfWeek, result).then(() => {
-              resolve();
-            });
-          });
-        }
-      });
-    });
+      } else {
+        break;
+      }
+    }
   },
 
   set(key, value) {
@@ -250,12 +229,14 @@ chrome.runtime.onInstalled.addListener(() => {
   const startweek = new Date(currentdate);
   startweek.setDate(currentdate.getDate() - currentdate.getDay());
   startweek.setHours(0, 0, 0, 0);
-  console.log("startweek set to: " + startweek.toString());
+  log("startweek set to: " + startweek.toString());
 
   const endweek = new Date(startweek);
   endweek.setDate(startweek.getDate() + 6);
   endweek.setHours(23, 59, 59, 999);
-  console.log("endweek set to: " + endweek.toString());
+  log("endweek set to: " + endweek.toString());
+  
+  scheduleNextWeekReset();
 
   Promise.all([
     storage.get("data_0"),
@@ -283,16 +264,16 @@ chrome.runtime.onInstalled.addListener(() => {
         limitifyCurweek,
         limitifyCurtab,
       ]) => {
-        console.log("sunday: " + JSON.stringify(data0));
-        console.log("monday: " + JSON.stringify(data1));
-        console.log("tuesday: " + JSON.stringify(data2));
-        console.log("wednesday: " + JSON.stringify(data3));
-        console.log("thursday: " + JSON.stringify(data4));
-        console.log("friday: " + JSON.stringify(data5));
-        console.log("saturday: " + JSON.stringify(data6));
-        console.log("limitifyBlocked: " + JSON.stringify(limitifyBlocked));
-        console.log("limitifyCurweek: " + JSON.stringify(limitifyCurweek));
-        console.log("limitifyCurtab: " + JSON.stringify(limitifyCurtab));
+        log("sunday: " + JSON.stringify(data0));
+        log("monday: " + JSON.stringify(data1));
+        log("tuesday: " + JSON.stringify(data2));
+        log("wednesday: " + JSON.stringify(data3));
+        log("thursday: " + JSON.stringify(data4));
+        log("friday: " + JSON.stringify(data5));
+        log("saturday: " + JSON.stringify(data6));
+        log("limitifyBlocked: " + JSON.stringify(limitifyBlocked));
+        log("limitifyCurweek: " + JSON.stringify(limitifyCurweek));
+        log("limitifyCurtab: " + JSON.stringify(limitifyCurtab));
 
         storage.set("limitify_data", {});
         Object.keys(limitifyBlocked).length === 0
@@ -306,28 +287,80 @@ chrome.runtime.onInstalled.addListener(() => {
             })
           : null;
 
-        Object.keys(limitifyCurtab).length === 0
-          ? storage.set_local("limitify_curtab", {
-              id: null,
-              url: "newtab",
-              favicon: null,
-              title: null,
-              startTime: Date.now(),
-              endTime: null,
-            })
-          : null;
+        storage.set_local("limitify_curtab", {...EMPTY_TAB});
 
-        console.log("Initialized storage.");
+        log("Initialized storage.");
+        
+        checkAndResetWeekIfNeeded();
       }
     )
     .catch((error) => {
-      console.log("ERROR: Failed to initialize storage", error);
+      log("ERROR: Failed to initialize storage: " + error);
     });
 });
 
-// Helper functions
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'weeklyReset') {
+    log("Weekly reset alarm triggered at Sunday midnight");
+    
+    const newWeekBoundaries = storage._getWeekBoundaries(new Date());
+    await storage._resetWeekData(newWeekBoundaries);
+    
+    scheduleNextWeekReset();
+  }
+});
+
 function log(message) {
   if (DEBUG) console.log(message);
+}
+
+function getNextSundayMidnight() {
+  const now = new Date();
+  const nextSunday = new Date(now);
+  
+  const daysUntilSunday = (7 - now.getDay()) % 7;
+  
+  if (daysUntilSunday === 0 && now.getHours() === 0 && now.getMinutes() === 0) {
+    nextSunday.setDate(now.getDate() + 7);
+  } else if (daysUntilSunday === 0) {
+    nextSunday.setDate(now.getDate() + 7);
+  } else {
+    nextSunday.setDate(now.getDate() + daysUntilSunday);
+  }
+  
+  nextSunday.setHours(0, 0, 0, 0);
+  return nextSunday;
+}
+
+function scheduleNextWeekReset() {
+  const nextSunday = getNextSundayMidnight();
+  const when = nextSunday.getTime();
+  
+  chrome.alarms.create('weeklyReset', { when });
+  log(`Weekly reset scheduled for: ${nextSunday.toString()}`);
+}
+
+async function checkAndResetWeekIfNeeded() {
+  try {
+    const curweek = await storage.get("limitify_curweek");
+    if (!curweek || !curweek.end) {
+      log("No curweek data found, skipping week check");
+      return;
+    }
+    
+    const now = Date.now();
+    const curweekend = curweek.end;
+    
+    if (now > curweekend) {
+      log("Week boundary crossed - resetting weekly data");
+      const newWeekBoundaries = storage._getWeekBoundaries(new Date(now));
+      await storage._resetWeekData(newWeekBoundaries);
+      
+      scheduleNextWeekReset();
+    }
+  } catch (error) {
+    log(`Error checking week reset: ${error}`);
+  }
 }
 
 function getCurrentTab() {
@@ -354,9 +387,25 @@ function getUrlHostname(tab) {
 async function saveTabSession(tab) {
   if (!tab?.startTime) return;
   
-  tab.endTime = Date.now();
+  const endTime = Date.now();
+  const duration = endTime - tab.startTime;
+  
+  // sanity check: reject sessions longer than 24 hours
+  // this catches stale/corrupted startTime values before processing
+  if (duration > MAX_SESSION_DURATION) {
+    log(`Session duration too long (${Math.floor(duration / 1000 / 60)} minutes), likely stale startTime. Skipping save.`);
+    return;
+  }
+  
+  if (duration < 1000) {
+    log(`Session duration too short (${duration}ms), skipping save.`);
+    return;
+  }
+  
+  tab.endTime = endTime;
   try {
     await storage.add(tab);
+    log(`Saved session for ${tab.url}: ${Math.floor(duration / 1000)} seconds`);
   } catch (error) {
     log(`Failed to save tab session: ${error}`);
   }
@@ -371,14 +420,22 @@ async function updateCurrentTab(tabId, tab) {
   const currentTab = await storage.get_local('limitify_curtab');
   const hostname = getUrlHostname(tab);
 
-  // Save previous tab session
-  if (currentTab?.startTime && !CHROME_URLS.includes(`chrome://${currentTab.url}`)) {
+  // Save previous tab session if it's a different tab/URL
+  if (currentTab?.startTime && 
+      !CHROME_URLS.includes(`chrome://${currentTab.url}`) &&
+      (currentTab.id !== tabId || currentTab.url !== hostname)) {
     await saveTabSession(currentTab);
   }
 
   // Don't track chrome URLs
   if (CHROME_URLS.includes(`chrome://${hostname}`)) {
-    await storage.set_local('limitify_curtab', EMPTY_TAB);
+    await storage.set_local('limitify_curtab', {...EMPTY_TAB});
+    return;
+  }
+
+  // If switching to the same tab, don't reset startTime
+  if (currentTab?.id === tabId && currentTab?.url === hostname && currentTab?.startTime) {
+    log(`Already tracking ${hostname}, keeping existing startTime`);
     return;
   }
 
@@ -392,6 +449,7 @@ async function updateCurrentTab(tabId, tab) {
   };
 
   await storage.set_local('limitify_curtab', newTabData);
+  log(`Started tracking: ${hostname}`);
 
   // Check if site should be blocked
   const blockedSites = await storage.get('limitify_blocked');
@@ -414,7 +472,7 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
     log('WINDOW_LOST_FOCUS: left browser window(s)');
     if (currentTab?.startTime) {
       await saveTabSession(currentTab);
-      await storage.set_local('limitify_curtab', EMPTY_TAB);
+      await storage.set_local('limitify_curtab', {...EMPTY_TAB});
     }
   } else {
     log('SWITCHED_WINDOWS: changed browser windows');
@@ -431,15 +489,17 @@ chrome.idle.onStateChanged.addListener(async (newState) => {
   log(`CHANGED STATE TO: ${newState}`);
   
   const currentTab = await storage.get_local('limitify_curtab');
-  if (!currentTab?.startTime) return;
-
-  await saveTabSession(currentTab);
-
+  
   if (newState === TAB_STATES.IDLE || newState === TAB_STATES.LOCKED) {
     log(`${newState.toUpperCase()}: gone into ${newState}`);
-    await storage.set_local('limitify_curtab', EMPTY_TAB);
+    if (currentTab?.startTime) {
+      await saveTabSession(currentTab);
+    }
+    await storage.set_local('limitify_curtab', {...EMPTY_TAB});
   } else if (newState === TAB_STATES.ACTIVE) {
-    log(`ACTIVE: back from being ${newState}`);
+    log(`ACTIVE: back from being idle/locked`);
+    await storage.set_local('limitify_curtab', {...EMPTY_TAB});
+    
     try {
       const tab = await getCurrentTab();
       await updateCurrentTab(tab.id, tab);
