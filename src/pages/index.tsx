@@ -54,13 +54,30 @@ export default function Home() {
   const handleToggle =
     (website: string) => (event: React.ChangeEvent<HTMLInputElement>) => {
       const newBlockedData = { ...blockedData };
-      newBlockedData[website] = !newBlockedData[website];
+      const isBlocking = !newBlockedData[website];
+      newBlockedData[website] = isBlocking;
       setBlockedData(newBlockedData);
 
       import("../../public/storage.js").then((storage) =>
         Promise.all([
           storage.default.set("limitify_blocked", newBlockedData),
-        ]).then()
+        ]).then(() => {
+          // If blocking, check if current tab matches and close it
+          if (isBlocking && typeof chrome !== 'undefined' && chrome.tabs) {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+              if (tabs && tabs[0] && tabs[0].url) {
+                try {
+                  const currentHostname = new URL(tabs[0].url).hostname;
+                  if (currentHostname === website) {
+                    chrome.tabs.remove(tabs[0].id!);
+                  }
+                } catch (e) {
+                  // Invalid URL, ignore
+                }
+              }
+            });
+          }
+        })
       );
     };
 
