@@ -129,19 +129,6 @@ export default function Home() {
           setTodayIndex(curDate.getDay());
           setAllData(tempAllData);
 
-          // Process tempAllData
-          var todaysData: { [key: string]: number } =
-            tempAllData[curDate.getDay().toString()] || {};
-
-          var sortedData = Object.entries(todaysData).sort(
-            (a, b) => b[1] - a[1]
-          );
-          todaysData = Object.fromEntries(sortedData);
-          setProcessedData(todaysData);
-
-          console.log("today's data: ");
-          console.log(todaysData);
-
           // Process "limitify_blocked"
           if (blockedResult) {
             setBlockedData(blockedResult);
@@ -165,17 +152,27 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (typeof window !== "undefined" && allData) {
+    if (typeof window !== "undefined" && allData && Object.keys(allData).length > 0) {
       setLoading(true);
       var daydata: { [key: string]: number } =
         allData[selectedBarIndex.toString()] || {};
+      
+      // If viewing today, add blocked sites with 0 time
+      if (selectedBarIndex === todayIndex) {
+        Object.keys(blockedData).forEach((site) => {
+          if (blockedData[site] === true && !(site in daydata)) {
+            daydata[site] = 0;
+          }
+        });
+      }
+      
       var sortedData = Object.entries(daydata).sort((a, b) => b[1] - a[1]);
       daydata = Object.fromEntries(sortedData);
       setProcessedData(daydata);
       setFilteredData(daydata);
       setLoading(false);
     }
-  }, [selectedBarIndex]);
+  }, [selectedBarIndex, todayIndex, blockedData, allData]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
