@@ -420,38 +420,36 @@ async function saveTabSession(tab) {
 }
 
 async function updateCurrentTab(tabId, tab) {
-  if (!tab?.url) {
-    log('Invalid tab data');
-    return;
-  }
-
   const sessions = await storage.get_local('active_sessions') || {};
   const hostname = getUrlHostname(tab);
 
   // Cleanup: Check existing sessions to see if they should stop
   for (const id in sessions) {
     const trackedTabId = parseInt(id);
-    
+
     // Skip the tab we are currently switching to/updating
     if (trackedTabId === tabId) continue;
 
     try {
+      const otherSession = sessions[id];
+      const isSameSite = otherSession.url === hostname;
       const t = await chrome.tabs.get(trackedTabId);
-      // Stop tracking if the tab is not the active one AND isn't playing audio
-      if (!t.active && !t.audible) {
-        log(`Stopping background session for ${sessions[id].url} (no audio)`);
-        await saveTabSession(sessions[id]);
+      
+      // Stop tracking if:
+      // - Tab is inactive AND not audible
+      // - OR it's the SAME website we just focused (deduplication)
+      if ((!t.active && !t.audible) || isSameSite) {
+        log(`Stopping ${isSameSite ? 'duplicate' : 'inactive'} session for ${otherSession.url}`);
+        await saveTabSession(otherSession);
         delete sessions[id];
       }
     } catch (e) {
-      // Tab likely closed or crashed; clean up the reference
       delete sessions[id];
     }
   }
 
-  // Handle tracking for the current tab
+  // If we switch to a Chrome internal page, stop tracking this specific tab
   if (CHROME_URLS.includes(`chrome://${hostname}`)) {
-    // If we switch to a Chrome internal page, stop tracking this specific tab
     if (sessions[tabId]) {
       await saveTabSession(sessions[tabId]);
       delete sessions[tabId];
@@ -470,13 +468,10 @@ async function updateCurrentTab(tabId, tab) {
         endTime: null
       };
       log(`Started tracking: ${hostname}`);
-    } else {
-      log(`Already tracking ${hostname} on tab ${tabId}, continuing session`);
     }
   }
 
   await storage.set_local('active_sessions', sessions);
-
   // Check if site should be blocked
   const blockedSites = await storage.get('limitify_blocked');
   if (blockedSites[hostname]) {
