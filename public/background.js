@@ -273,7 +273,7 @@ chrome.runtime.onInstalled.addListener(() => {
         log("saturday: " + JSON.stringify(data6));
         log("limitifyBlocked: " + JSON.stringify(limitifyBlocked));
         log("limitifyCurweek: " + JSON.stringify(limitifyCurweek));
-        log("limitifyCurtab: " + JSON.stringify(limitifyCurtab));
+        log("activeSessions: " + JSON.stringify(activeSessions));
 
         storage.set("limitify_data", {});
         Object.keys(limitifyBlocked).length === 0
