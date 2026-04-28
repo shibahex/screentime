@@ -421,7 +421,6 @@ async function saveTabSession(tab) {
 
 // processing queue
 const processingTabs = new Set();
-
 async function updateCurrentTab(tabId, tab) {
   if (!tab?.url) return;
   if (processingTabs.has(tabId)) {
@@ -441,19 +440,21 @@ async function updateCurrentTab(tabId, tab) {
 
       // Skip the tab we are currently switching to/updating
       if (trackedTabId === tabId) continue;
-
+  
       try {
         const otherSession = sessions[id];
         const isSameSite = otherSession.url === hostname;
         const t = await chrome.tabs.get(trackedTabId);
         const isDifferentWindow = t.windowId !== tab.windowId;
 
+        const focusedWindow = await chrome.windows.getLastFocused();
+        const isWindowFocused = t.windowId === focusedWindow.id && focusedWindow.focused;
         // Stop tracking if
+        // 1. Silent and same website (prevents double-counting silent tabs)
+        // 3. Silent and inactive or unfocused (standard background tab)
         // 1. Silent and in a different window (multi-window support)
-        // 2. Silent and same website (prevents double-counting silent tabs)
-        // 3. Silent and inactive in this window (standard background tab)
         const isSilentSameSite = isSameSite && !t.audible;
-        const isBackgroundInactive = !t.active && !t.audible;
+        const isBackgroundInactive = (!t.active || !isWindowFocused) && !t.audible;
         const isOtherWindowSilent = isDifferentWindow && !t.audible;
         if (isOtherWindowSilent || isSilentSameSite || isBackgroundInactive) {
           log(`Stopping ${isSameSite ? 'duplicate' : 'inactive'} session for ${otherSession.url}`);
@@ -524,18 +525,32 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
     log('WINDOW_LOST_FOCUS: All browser windows lost focus');
     // Save all sessions that aren't playing audio
     for (const id in sessions) {
-      const tabInfo = await chrome.tabs.get(parseInt(id)).catch(() => null);
-      if (!tabInfo?.audible) {
-        await saveTabSession(sessions[id]);
+      try {
+        const tabInfo = await chrome.tabs.get(parseInt(id)).catch(() => null);
+        if (!tabInfo?.audible) {
+          await saveTabSession(sessions[id]);
+          delete sessions[id];
+        }
+      } catch (e) {
+        log("caught exception looking for tab info, deleteing session.")
         delete sessions[id];
       }
     }
     await storage.set_local('active_sessions', sessions);
+
   } else {
     log('SWITCHED_WINDOWS: Focused a browser window');
     try {
-      const tab = await getCurrentTab();
-      if (tab) await updateCurrentTab(tab.id, tab);
+      // Get the specific window that just gained focus
+      const win = await chrome.windows.get(windowId);
+
+      // If the window is focused, find its active tab and start/resume tracking
+      if (win.focused) {
+        const [tab] = await chrome.tabs.query({ active: true, windowId: windowId });
+        if (tab) {
+          await updateCurrentTab(tab.id, tab);
+        }
+      }
     } catch (error) {
       log(`Failed to handle window focus: ${error}`);
     }
@@ -627,6 +642,7 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 
 // CRITICAL: Save time when tab is closed
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
+  processingTabs.delete(tabId)
   let sessions = await storage.get_local('active_sessions') || {};
   
   if (sessions[tabId]) {
@@ -670,3 +686,46 @@ chrome.runtime.setUninstallURL(
   "https://forms.gle/3f8MTHYmVVpL9jCK9"
 )
 
+
+// Heartbeat to catch focus loss to applications (every 15s)
+setInterval(async () => {
+  try {
+    const win = await chrome.windows.getLastFocused();
+    let sessions = await storage.get_local('active_sessions') || {};
+
+    if (win && !win.focused) {
+      let changed = false;
+      for (const id in sessions) {
+        const t = await chrome.tabs.get(parseInt(id)).catch(() => null);
+        if (t && !t.audible) {
+          log(`Heartbeat: Detected external app focus. Saving ${sessions[id].url}`);
+          await saveTabSession(sessions[id]);
+          delete sessions[id];
+          changed = true;
+        }
+      }
+      if (changed) await storage.set_local('active_sessions', sessions);
+    } 
+
+    // If we are back in Chrome, ensure we are actually tracking the active tab
+    else if (win && win.focused) {
+      const [activeTab] = await chrome.tabs.query({ active: true, windowId: win.id });
+      if (activeTab && !sessions[activeTab.id]) {
+        log(`Heartbeat: User is back. Resuming ${activeTab.url}`);
+        await updateCurrentTab(activeTab.id, activeTab);
+      }
+    }
+  } catch (e) {
+    log("Heartbeat: No windows detected. Cleaning up all active sessions.");
+    let sessions = await storage.get_local('active_sessions') || {};
+
+    if (Object.keys(sessions).length > 0) {
+      for (const id in sessions) {
+        log(`Closing session for ${sessions[id].url} (No windows open)`);
+        await saveTabSession(sessions[id]);
+      }
+      // Wipe the active_sessions object clean in storage
+      await storage.set_local('active_sessions', {});
+    }
+  }
+}, 15000);
