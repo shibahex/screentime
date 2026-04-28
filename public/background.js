@@ -419,72 +419,101 @@ async function saveTabSession(tab) {
   }
 }
 
+// processing queue
+const processingTabs = new Set();
+
 async function updateCurrentTab(tabId, tab) {
-  const sessions = await storage.get_local('active_sessions') || {};
-  const hostname = getUrlHostname(tab);
-
-  // Cleanup: Check existing sessions to see if they should stop
-  for (const id in sessions) {
-    const trackedTabId = parseInt(id);
-
-    // Skip the tab we are currently switching to/updating
-    if (trackedTabId === tabId) continue;
-
-    try {
-      const otherSession = sessions[id];
-      const isSameSite = otherSession.url === hostname;
-      const t = await chrome.tabs.get(trackedTabId);
-      
-      // Stop tracking if:
-      // - Tab is inactive AND not audible
-      // - OR it's the SAME website we just focused (deduplication)
-      if ((!t.active && !t.audible) || isSameSite) {
-        log(`Stopping ${isSameSite ? 'duplicate' : 'inactive'} session for ${otherSession.url}`);
-        await saveTabSession(otherSession);
-        delete sessions[id];
-      }
-    } catch (e) {
-      delete sessions[id];
-    }
+  if (!tab?.url) return;
+  if (processingTabs.has(tabId)) {
+    log(`blocked redundant update for tab ${tabId} (already processing)`);
+    return;
   }
+  processingTabs.add(tabId);
 
-  // If we switch to a Chrome internal page, stop tracking this specific tab
-  if (CHROME_URLS.includes(`chrome://${hostname}`)) {
-    if (sessions[tabId]) {
-      await saveTabSession(sessions[tabId]);
-      delete sessions[tabId];
-    }
-  } else {
-    // If this tab isn't already being tracked, or the URL changed, start a new session
-    if (!sessions[tabId] || sessions[tabId].url !== hostname) {
-      // If there was a different URL in this same tab ID, save the old one first
-      if (sessions[tabId]) await saveTabSession(sessions[tabId]);
 
-      sessions[tabId] = {
-        id: tabId,
-        url: hostname,
-        title: tab.title,
-        startTime: Date.now(),
-        endTime: null
-      };
-      log(`Started tracking: ${hostname}`);
-    }
-  }
+  try {
+    const sessions = await storage.get_local('active_sessions') || {};
+    const hostname = getUrlHostname(tab);
 
-  await storage.set_local('active_sessions', sessions);
-  // Check if site should be blocked
-  const blockedSites = await storage.get('limitify_blocked');
-  if (blockedSites[hostname]) {
-    setTimeout(() => {
+    // Cleanup: Check existing sessions to see if they should stop
+    for (const id in sessions) {
+      const trackedTabId = parseInt(id);
+
+      // Skip the tab we are currently switching to/updating
+      if (trackedTabId === tabId) continue;
+
       try {
-        chrome.tabs.remove(tabId);
-        // Clean up session if removed
-        delete sessions[tabId];
-        storage.set_local('active_sessions', sessions);
+        const otherSession = sessions[id];
+        const isSameSite = otherSession.url === hostname;
+        const t = await chrome.tabs.get(trackedTabId);
+        const isDifferentWindow = t.windowId !== tab.windowId;
+
+        // Stop tracking if
+        // 1. Silent and in a different window (multi-window support)
+        // 2. Silent and same website (prevents double-counting silent tabs)
+        // 3. Silent and inactive in this window (standard background tab)
+        const isSilentSameSite = isSameSite && !t.audible;
+        const isBackgroundInactive = !t.active && !t.audible;
+        const isOtherWindowSilent = isDifferentWindow && !t.audible;
+        if (isOtherWindowSilent || isSilentSameSite || isBackgroundInactive) {
+          log(`Stopping ${isSameSite ? 'duplicate' : 'inactive'} session for ${otherSession.url}`);
+          await saveTabSession(otherSession);
+          delete sessions[id];
+        }
       } catch (e) {
-        log(`Error removing blocked tab: ${e}`);
+        log(`Warning: Failed to verify background tab ${id} (${e}). Forcing save and cleanup.`);
+        if (sessions[id]) {
+          await saveTabSession(sessions[id]);
+          delete sessions[id];
+        }
       }
-    }, 1000);
+    }
+
+    // If we switch to a Chrome internal page, stop tracking this specific tab
+    if (CHROME_URLS.includes(`chrome://${hostname}`)) {
+      if (sessions[tabId]) {
+        await saveTabSession(sessions[tabId]);
+        delete sessions[tabId];
+      }
+    } else {
+      // If this tab isn't already being tracked, or the URL changed, start a new session
+      if (!sessions[tabId] || sessions[tabId].url !== hostname) {
+        // If there was a different URL in this same tab ID, save the old one first
+        if (sessions[tabId]) {
+            log(`URL changed in tab ${tabId}. Saving old session for ${sessions[tabId].url}`);
+            await saveTabSession(sessions[tabId]); 
+        }
+
+        sessions[tabId] = {
+          id: tabId,
+          url: hostname,
+          title: tab.title,
+          startTime: Date.now(),
+          endTime: null
+        };
+        log(`Started tracking: ${hostname}`);
+      }
+    }
+
+    await storage.set_local('active_sessions', sessions);
+    // Check if site should be blocked
+    const blockedSites = await storage.get('limitify_blocked');
+    if (blockedSites[hostname]) {
+      setTimeout(() => {
+        try {
+          chrome.tabs.remove(tabId);
+          // Clean up session if removed
+          delete sessions[tabId];
+          storage.set_local('active_sessions', sessions);
+        } catch (e) {
+          log(`Error removing blocked tab: ${e}`);
+        }
+      }, 1000);
+    }
+  } catch (error) {
+    log(`CRITICAL TRACKER ERROR: ${error}`);
+  } finally {
+      processingTabs.delete(tabId);
   }
 }
 
@@ -549,13 +578,48 @@ chrome.idle.onStateChanged.addListener(async (newState) => {
   }
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete') {
     updateCurrentTab(tabId, tab);
   }
+
+  // listener that checks for audio changes for tabs
+  if (changeInfo.audible === false) {
+    log(`Audio stopped on tab ${tabId}. checking if background session should end...`);
+    
+    // Safety check: if we're already busy with another event, skip this
+    if (processingTabs.has(tabId)) {
+      log(`blocked redundant update for ${tab.url} (already processing)`);
+      return;
+    }
+    
+    let sessions = await storage.get_local('active_sessions') || {};
+    const session = sessions[tabId];
+
+    // Only stop it if: 
+    // 1. We are currently tracking it
+    // 2. It is NOT the active tab (because active tabs should track even if silent)
+    if (session && !tab.active) {
+      processingTabs.add(tabId);
+      log(`Stopping background session for ${session.url} (audio ended)`);
+
+      try {
+        await saveTabSession(session);
+        delete sessions[tabId];
+        await storage.set_local('active_sessions', sessions);
+      } catch (e) {
+        log(`Error ending audio session: ${e}`);
+      } finally {
+        processingTabs.delete(tabId);
+      }
+    }
+  }
 });
 
+let lastActivatedTabId = null;
 chrome.tabs.onActivated.addListener((activeInfo) => {
+  lastActivatedTabId = activeInfo.tabId;
   chrome.tabs.get(activeInfo.tabId, (tab) => {
     updateCurrentTab(tab.id, tab);
   });
@@ -588,9 +652,14 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
 chrome.tabs.onHighlighted.addListener((highlightInfo) => {
   if (highlightInfo.tabIds.length > 0) {
     const tabId = highlightInfo.tabIds[0];
+    // Skip if onActivated already handled this tab
+    if (tabId === lastActivatedTabId) {
+      log(`Tab highlighted: ${tabId} (skipped, already handled by onActivated)`);
+      return;
+    }
     chrome.tabs.get(tabId, (tab) => {
       if (tab) {
-        log(`Tab highlighted: ${tabId}`);
+        log(`Tab highlighted: ${tabId} (fallback)`);
         updateCurrentTab(tabId, tab);
       }
     });
