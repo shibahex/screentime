@@ -249,7 +249,7 @@ chrome.runtime.onInstalled.addListener(() => {
 
     storage.get("limitify_blocked"),
     storage.get("limitify_curweek"),
-    storage.get_local("limitify_curtab"),
+    storage.get_local("active_sessions"),
   ])
     .then(
       ([
@@ -262,7 +262,7 @@ chrome.runtime.onInstalled.addListener(() => {
         data6,
         limitifyBlocked,
         limitifyCurweek,
-        limitifyCurtab,
+        activeSessions,
       ]) => {
         log("sunday: " + JSON.stringify(data0));
         log("monday: " + JSON.stringify(data1));
