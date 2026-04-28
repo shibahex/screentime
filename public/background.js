@@ -520,7 +520,7 @@ chrome.idle.onStateChanged.addListener(async (newState) => {
   log(`CHANGED STATE TO: ${newState}`);
   let sessions = await storage.get_local('active_sessions') || {};
 
-  //TODO: DONT TRACK ON UNLOCKED
+  //TODO: DONT TRACK ON LOCKED
   if (newState === TAB_STATES.IDLE || newState === TAB_STATES.LOCKED) {
     isIdle = (newState === TAB_STATES.IDLE);
 
@@ -540,8 +540,12 @@ chrome.idle.onStateChanged.addListener(async (newState) => {
   } else if (newState === TAB_STATES.ACTIVE) {
     isIdle = false;
     log(`User active, resuming focused tab tracking`);
-    const tab = await getCurrentTab();
-    if (tab) await updateCurrentTab(tab.id, tab);
+    try{
+      const tab = await getCurrentTab();
+      if (tab) await updateCurrentTab(tab.id, tab);
+    } catch (error) {
+      log(`Failed to get tab: ${error}`);
+    }
   }
 });
 
