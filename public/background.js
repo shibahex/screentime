@@ -509,8 +509,16 @@ chrome.idle.onStateChanged.addListener(async (newState) => {
   if (newState === TAB_STATES.IDLE) {
     // User idle (no input) but screen still on
     isIdle = true;
-    log(`User went idle, continuing to track (video/reading)`);
-    
+    const tabInfo = await chrome.tabs.get(currentTab.id).catch(() => null);
+    const isPlayingMedia = tabInfo?.audible;
+    if (isPlayingMedia){
+      log(`User idle, but media detected. Continuing track.`);
+      isIdle = true; 
+    } else {
+      log(`User idle, but media not detected, stopping tracking`)
+      await saveTabSession(currentTab);
+      await storage.set_local('limitify_curtab', {...EMPTY_TAB});
+    }
   } else if (newState === TAB_STATES.LOCKED) {
     // Screen locked - user definitely not using computer
     // Save session and stop tracking
