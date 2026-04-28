@@ -287,7 +287,7 @@ chrome.runtime.onInstalled.addListener(() => {
             })
           : null;
 
-        storage.set_local("limitify_curtab", {...EMPTY_TAB});
+        storage.set_local("active_sessions", {});
 
         log("Initialized storage.");
         
@@ -425,39 +425,57 @@ async function updateCurrentTab(tabId, tab) {
     return;
   }
 
-  const currentTab = await storage.get_local('limitify_curtab');
+  const sessions = await storage.get_local('active_sessions') || {};
   const hostname = getUrlHostname(tab);
 
-  // Save previous tab session if it's a different tab/URL
-  if (currentTab?.startTime && 
-      !CHROME_URLS.includes(`chrome://${currentTab.url}`) &&
-      (currentTab.id !== tabId || currentTab.url !== hostname)) {
-    await saveTabSession(currentTab);
+  // Cleanup: Check existing sessions to see if they should stop
+  for (const id in sessions) {
+    const trackedTabId = parseInt(id);
+    
+    // Skip the tab we are currently switching to/updating
+    if (trackedTabId === tabId) continue;
+
+    try {
+      const t = await chrome.tabs.get(trackedTabId);
+      // Stop tracking if the tab is not the active one AND isn't playing audio
+      if (!t.active && !t.audible) {
+        log(`Stopping background session for ${sessions[id].url} (no audio)`);
+        await saveTabSession(sessions[id]);
+        delete sessions[id];
+      }
+    } catch (e) {
+      // Tab likely closed or crashed; clean up the reference
+      delete sessions[id];
+    }
   }
 
-  // Don't track chrome URLs
+  // Handle tracking for the current tab
   if (CHROME_URLS.includes(`chrome://${hostname}`)) {
-    await storage.set_local('limitify_curtab', {...EMPTY_TAB});
-    return;
+    // If we switch to a Chrome internal page, stop tracking this specific tab
+    if (sessions[tabId]) {
+      await saveTabSession(sessions[tabId]);
+      delete sessions[tabId];
+    }
+  } else {
+    // If this tab isn't already being tracked, or the URL changed, start a new session
+    if (!sessions[tabId] || sessions[tabId].url !== hostname) {
+      // If there was a different URL in this same tab ID, save the old one first
+      if (sessions[tabId]) await saveTabSession(sessions[tabId]);
+
+      sessions[tabId] = {
+        id: tabId,
+        url: hostname,
+        title: tab.title,
+        startTime: Date.now(),
+        endTime: null
+      };
+      log(`Started tracking: ${hostname}`);
+    } else {
+      log(`Already tracking ${hostname} on tab ${tabId}, continuing session`);
+    }
   }
 
-  // If switching to the same tab, don't reset startTime
-  if (currentTab?.id === tabId && currentTab?.url === hostname && currentTab?.startTime) {
-    log(`Already tracking ${hostname}, keeping existing startTime`);
-    return;
-  }
-
-  // Set up tracking for new tab
-  const newTabData = {
-    id: tabId,
-    url: hostname,
-    title: tab.title,
-    startTime: Date.now(),
-    endTime: null
-  };
-
-  await storage.set_local('limitify_curtab', newTabData);
-  log(`Started tracking: ${hostname}`);
+  await storage.set_local('active_sessions', sessions);
 
   // Check if site should be blocked
   const blockedSites = await storage.get('limitify_blocked');
@@ -465,6 +483,9 @@ async function updateCurrentTab(tabId, tab) {
     setTimeout(() => {
       try {
         chrome.tabs.remove(tabId);
+        // Clean up session if removed
+        delete sessions[tabId];
+        storage.set_local('active_sessions', sessions);
       } catch (e) {
         log(`Error removing blocked tab: ${e}`);
       }
@@ -473,25 +494,24 @@ async function updateCurrentTab(tabId, tab) {
 }
 
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
-  const currentTab = await storage.get_local('limitify_curtab');
+  const sessions = await storage.get_local('active_sessions') || {};
 
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
-    // don't stop tracking if user is just idle (video might be playing)
-    if (isIdle) {
-      log('WINDOW_LOST_FOCUS during idle: keeping tracking (video playing)');
-      return;
+    log('WINDOW_LOST_FOCUS: All browser windows lost focus');
+    // Save all sessions that aren't playing audio
+    for (const id in sessions) {
+      const tabInfo = await chrome.tabs.get(parseInt(id)).catch(() => null);
+      if (!tabInfo?.audible) {
+        await saveTabSession(sessions[id]);
+        delete sessions[id];
+      }
     }
-    
-    log('WINDOW_LOST_FOCUS: left browser window(s)');
-    if (currentTab?.startTime) {
-      await saveTabSession(currentTab);
-      await storage.set_local('limitify_curtab', {...EMPTY_TAB});
-    }
+    await storage.set_local('active_sessions', sessions);
   } else {
-    log('SWITCHED_WINDOWS: changed browser windows');
+    log('SWITCHED_WINDOWS: Focused a browser window');
     try {
       const tab = await getCurrentTab();
-      await updateCurrentTab(tab.id, tab);
+      if (tab) await updateCurrentTab(tab.id, tab);
     } catch (error) {
       log(`Failed to handle window focus: ${error}`);
     }
@@ -503,47 +523,30 @@ let isIdle = false;
 
 chrome.idle.onStateChanged.addListener(async (newState) => {
   log(`CHANGED STATE TO: ${newState}`);
-  
-  const currentTab = await storage.get_local('limitify_curtab');
-  
-  if (newState === TAB_STATES.IDLE) {
-    // User idle (no input) but screen still on
-    isIdle = true;
-    const tabInfo = await chrome.tabs.get(currentTab.id).catch(() => null);
-    const isPlayingMedia = tabInfo?.audible;
-    if (isPlayingMedia){
-      log(`User idle, but media detected. Continuing track.`);
-      isIdle = true; 
-    } else {
-      log(`User idle, but media not detected, stopping tracking`)
-      await saveTabSession(currentTab);
-      await storage.set_local('limitify_curtab', {...EMPTY_TAB});
-    }
-  } else if (newState === TAB_STATES.LOCKED) {
-    // Screen locked - user definitely not using computer
-    // Save session and stop tracking
-    isIdle = false;
-    log(`Screen locked, stopping tracking`);
-    if (currentTab?.startTime) {
-      await saveTabSession(currentTab);
-      await storage.set_local('limitify_curtab', {...EMPTY_TAB});
-    }
-    
-  } else if (newState === TAB_STATES.ACTIVE) {
-    // User returned - start tracking current tab
-    isIdle = false;
-    log(`User active again, resuming tracking`);
-    
-    // If we had stopped tracking (from locked), restart
-    const hasTracking = currentTab?.startTime;
-    if (!hasTracking) {
-      try {
-        const tab = await getCurrentTab();
-        await updateCurrentTab(tab.id, tab);
-      } catch (error) {
-        log(`Failed to resume tracking: ${error}`);
+  let sessions = await storage.get_local('active_sessions') || {};
+
+  //TODO: DONT TRACK ON UNLOCKED
+  if (newState === TAB_STATES.IDLE || newState === TAB_STATES.LOCKED) {
+    isIdle = (newState === TAB_STATES.IDLE);
+
+    for (const id in sessions) {
+      const tabId = parseInt(id);
+      const tabInfo = await chrome.tabs.get(tabId).catch(() => null);
+      
+      // Stop session if: Computer is LOCKED OR (User is IDLE and no audio is playing)
+      if (newState === TAB_STATES.LOCKED || !tabInfo?.audible) {
+        log(`Stopping session for ${sessions[id].url} due to inactivity.`);
+        await saveTabSession(sessions[id]);
+        delete sessions[id];
       }
     }
+    await storage.set_local('active_sessions', sessions);
+
+  } else if (newState === TAB_STATES.ACTIVE) {
+    isIdle = false;
+    log(`User active, resuming focused tab tracking`);
+    const tab = await getCurrentTab();
+    if (tab) await updateCurrentTab(tab.id, tab);
   }
 });
 
@@ -561,13 +564,13 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 
 // CRITICAL: Save time when tab is closed
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
-  const currentTab = await storage.get_local('limitify_curtab');
+  let sessions = await storage.get_local('active_sessions') || {};
   
-  // If the closed tab is the one we're tracking, save its session
-  if (currentTab?.id === tabId && currentTab?.startTime) {
-    log(`Tab closed: ${tabId}, saving session`);
-    await saveTabSession(currentTab);
-    await storage.set_local('limitify_curtab', {...EMPTY_TAB});
+  if (sessions[tabId]) {
+    log(`Tab ${tabId} closed, saving session for ${sessions[tabId].url}`);
+    await saveTabSession(sessions[tabId]);
+    delete sessions[tabId];
+    await storage.set_local('active_sessions', sessions);
   }
 });
 
