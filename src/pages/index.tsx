@@ -276,7 +276,7 @@ export default function Home() {
   };
 
   return (
-    <body className={`bg-white dark:bg-[#272624] min-h-screen ${inter.className}`}>
+    <div className={`bg-white dark:bg-[#272624] min-h-screen ${inter.className}`}>
       <div className="px-3 py-3">
         {loading ? (
           <h2 className="mt-4 text-4xl font-extrabold text-black dark:text-white">
@@ -496,6 +496,6 @@ export default function Home() {
           </div>
         </div>
       </div>
-    </body>
+    </div>
   );
 }
